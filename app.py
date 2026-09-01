@@ -1,63 +1,85 @@
-from fastapi import FastAPI
-import uvicorn
-from phi.assistant import Assistant
-from phi.tools.duckduckgo import DuckDuckGo
-from phi.llm.groq import Groq
-from dotenv import load_dotenv
-import json
 import os
-import requests
-load_dotenv()
+import PyPDF2
+import google.generativeai as genai
+from sentence_transformers import SentenceTransformer
+from sklearn.metrics.pairwise import cosine_similarity
+import numpy as np
+from fastapi import FastAPI, File, UploadFile, Form
+from fastapi.responses import JSONResponse
+import uvicorn
+import tempfile
+
 app = FastAPI()
 
-@app.get("/process-ingredients/")
-async def process_ingredients(product_name: str):
-    assistant = Assistant(
-        llm=Groq(model="llama3-groq-70b-8192-tool-use-preview"),
-        tools=[DuckDuckGo()],
-        description="You are a diet research expert and your job is to research and tell the ingredients list along with their composition of any given product in a specific JSON format.",
-        instructions=[
-            "Provide the response strictly in the following JSON format without any pretext or disclaimer",
-            """Required Output format: "{\"product_name\":\"<ProductName>\",\"ingredients\":[{\"name\":\"<Ingredient1>\",\"composition\":\"<X grams/mg>\"},{\"name\":\"<Ingredient2>\",\"composition\":\"<Y grams/mg>\"}]}" """,
-            "Add more ingredients as needed but in a JSON format",
-            "ONLY Respond back with json. Nothing extra."
-        ],
-        debug_mode=True
-    )
-    
-    # Generate response
-    output = assistant.run(f"{product_name} Ingredients list", stream=False)
-    print(f"Agent Raw Response: {output}")
-    # The string response from the AI agent
-    # response = f'{{"response": {output}}}'
+# Configure Gemini API
+genai_api_key = os.environ.get('GENAI_API_KEY')
+if not genai_api_key:
+    raise ValueError("GENAI_API_KEY environment variable is not set")
+genai.configure(api_key=genai_api_key)
 
-# Convert the string to a Python dictionary
-    response = json.loads(output)
+# Initialize the sentence transformer model
+model = SentenceTransformer('all-MiniLM-L6-v2')
 
-# Now clean_response is a proper dictionary
-    print(json.dumps(response, indent=4))
-    # assistant.print_response(f"{product_name} Ingredients list", markdown=False)
-    # response_data = json.loads(response)
-    ingredients = [ingredient["name"] for ingredient in response["ingredients"]]
-    ingredient_query = ', '.join(ingredients)
-    
-    # # Send the query to Wolfram Alpha API
-    WOLFRAM_API_KEY = os.getenv("WOLFRAM_API_KEY")
+def read_pdf(file_path):
+    with open(file_path, 'rb') as file:
+        reader = PyPDF2.PdfReader(file)
+        text = ''
+        for page in reader.pages:
+            text += page.extract_text()
+    return text
 
-    wolfram_url = f"http://api.wolframalpha.com/v2/query?input={ingredient_query}&format=plaintext&output=JSON&appid={WOLFRAM_API_KEY}"
-    wolfram_response = requests.get(wolfram_url)
+def split_into_chunks(text, chunk_size=1000):
+    return [text[i:i+chunk_size] for i in range(0, len(text), chunk_size)]
+
+def encode_chunks(chunks):
+    return model.encode(chunks)
+
+def find_relevant_chunks(query, chunks, embeddings, top_k=3):
+    query_embedding = model.encode([query])
+    similarities = cosine_similarity(query_embedding, embeddings)[0]
+    top_indices = np.argsort(similarities)[-top_k:]
+    return [chunks[i] for i in top_indices]
+
+def generate_answer(query, context):
+    prompt = f"""
+    Context: {context}
+
+    Question: {query}
+
+    Please provide a concise and accurate answer to the question based on the given context. 
+    If the context doesn't contain enough information to answer the question, please state that.
+    """
     
-    if wolfram_response.status_code == 200:
-        wolfram_data = wolfram_response.json()
-        # Extract necessary information from Wolfram's response (depends on the API structure)
-        nutritional_info = wolfram_data["queryresult"]  # Example of how to parse the response
-    else:
-        nutritional_info = {"error": "Failed to retrieve data from Wolfram API"}
-    
-    return {"response": response, "nutritional_info": nutritional_info}
-    # response_data = json.loads(response)
-    # return {"response": cleaned_text}
-    # return response_dict
+    model = genai.GenerativeModel('gemini-pro')
+    response = model.generate_content(prompt)
+    return response.text
+
+def rag_pdf_qa(pdf_path, query):
+    text = read_pdf(pdf_path)
+    chunks = split_into_chunks(text)
+    embeddings = encode_chunks(chunks)
+    relevant_chunks = find_relevant_chunks(query, chunks, embeddings)
+    context = " ".join(relevant_chunks)
+    answer = generate_answer(query, context)
+    return answer
+
+@app.post("/rag_qa")
+async def rag_qa_endpoint(file: UploadFile = File(...), query: str = Form(...)):
+    try:
+        # Save the uploaded file temporarily
+        with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as temp_file:
+            temp_file.write(await file.read())
+            temp_file_path = temp_file.name
+
+        # Process the PDF and generate the answer
+        answer = rag_pdf_qa(temp_file_path, query)
+
+        # Remove the temporary file
+        os.unlink(temp_file_path)
+
+        return JSONResponse(content={"answer": answer})
+    except Exception as e:
+        return JSONResponse(content={"error": str(e)}, status_code=500)
 
 if __name__ == "__main__":
     uvicorn.run(app, host="0.0.0.0", port=10000)
